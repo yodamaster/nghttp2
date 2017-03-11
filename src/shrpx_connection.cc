@@ -60,7 +60,8 @@ Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
                        IOCb readcb, TimerCb timeoutcb, void *data,
                        size_t tls_dyn_rec_warmup_threshold,
                        ev_tstamp tls_dyn_rec_idle_timeout, shrpx_proto proto)
-    : tls{DefaultMemchunks(mcpool), DefaultPeekMemchunks(mcpool)},
+    : tls{DefaultMemchunks(mcpool), DefaultPeekMemchunks(mcpool),
+          DefaultMemchunks(mcpool)},
       wlimit(loop, &wev, write_limit.rate, write_limit.burst),
       rlimit(loop, &rev, read_limit.rate, read_limit.burst, this),
       loop(loop),
@@ -120,9 +121,10 @@ void Connection::disconnect() {
     tls.warmup_writelen = 0;
     tls.last_writelen = 0;
     tls.last_readlen = 0;
-    tls.handshake_state = 0;
+    tls.handshake_state = TLS_CONN_NORMAL;
     tls.initial_handshake_done = false;
     tls.reneg_started = false;
+    tls.early_data_finish = false;
   }
 
   if (fd != -1) {
@@ -140,7 +142,11 @@ void Connection::disconnect() {
   wlimit.stopw();
 }
 
-void Connection::prepare_client_handshake() { SSL_set_connect_state(tls.ssl); }
+void Connection::prepare_client_handshake() {
+  SSL_set_connect_state(tls.ssl);
+  // This prevents SSL_read_early_data from being called.
+  tls.early_data_finish = true;
+}
 
 void Connection::prepare_server_handshake() {
   SSL_set_accept_state(tls.ssl);
@@ -330,8 +336,9 @@ int Connection::tls_handshake() {
   wlimit.stopw();
   ev_timer_stop(loop, &wt);
 
+  std::array<uint8_t, 16_k> buf;
+
   if (ev_is_active(&rev)) {
-    std::array<uint8_t, 8_k> buf;
     auto nread = read_clear(buf.data(), buf.size());
     if (nread < 0) {
       if (LOG_ENABLED(INFO)) {
@@ -384,7 +391,52 @@ int Connection::tls_handshake() {
     break;
   }
 
-  auto rv = SSL_do_handshake(tls.ssl);
+  int rv;
+
+#if OPENSSL_1_1_1_API
+  if (!tls.server_handshake || tls.early_data_finish) {
+    rv = SSL_do_handshake(tls.ssl);
+  } else {
+    for (;;) {
+      size_t nread;
+
+      rv = SSL_read_early_data(tls.ssl, buf.data(), buf.size(), &nread);
+      if (rv == SSL_READ_EARLY_DATA_ERROR) {
+        // If we have early data, and server sends ServerHello, assume
+        // that handshake is completed in server side, and start
+        // processing request.  If we don't exit handshake code here,
+        // server waits for EndOfEarlyData and Finished message from
+        // client, which voids the purpose of 0-RTT data.  The left
+        // over of handshake is done through write_tls or read_tls.
+        rv = tls.wbuf.rleft() && tls.earlybuf.rleft();
+        break;
+      }
+
+      if (LOG_ENABLED(INFO)) {
+        LOG(INFO) << "tls: read early data " << nread << " bytes";
+      }
+
+      tls.earlybuf.append(buf.data(), nread);
+
+      if (rv == SSL_READ_EARLY_DATA_FINISH) {
+        if (LOG_ENABLED(INFO)) {
+          LOG(INFO) << "tls: read all early data; total "
+                    << tls.earlybuf.rleft() << " bytes";
+        }
+        tls.early_data_finish = true;
+        // The same reason stated above.
+        if (tls.wbuf.rleft() && tls.earlybuf.rleft()) {
+          rv = 1;
+        } else {
+          rv = SSL_do_handshake(tls.ssl);
+        }
+        break;
+      }
+    }
+  }
+#else  // !OPENSSL_1_1_1_API
+  rv = SSL_do_handshake(tls.ssl);
+#endif // !OPENSSL_1_1_1_API
 
   if (rv <= 0) {
     auto err = SSL_get_error(tls.ssl, rv);
@@ -624,6 +676,15 @@ ssize_t Connection::write_tls(const void *data, size_t len) {
     auto err = SSL_get_error(tls.ssl, rv);
     switch (err) {
     case SSL_ERROR_WANT_READ:
+#ifdef TLS1_3_VERSION
+      // TLSv1.3 has no renegotiation.  If we get here, the initial
+      // handshake is still going on.  The assumption is that server
+      // still waiting for EndOfEarlyData and Finished messages.
+      if (SSL_version(tls.ssl) == TLS1_3_VERSION) {
+        wlimit.stopw();
+        return 0;
+      }
+#endif // TLS1_3_VERSION
       if (LOG_ENABLED(INFO)) {
         LOG(INFO) << "Close connection due to TLS renegotiation";
       }
@@ -653,6 +714,49 @@ ssize_t Connection::write_tls(const void *data, size_t len) {
 }
 
 ssize_t Connection::read_tls(void *data, size_t len) {
+#if OPENSSL_1_1_1_API
+  if (tls.earlybuf.rleft()) {
+    return tls.earlybuf.remove(data, len);
+  }
+  if (!tls.early_data_finish) {
+    // TLSv1.3 handshake is still going on.
+    size_t nread;
+    auto rv = SSL_read_early_data(tls.ssl, data, len, &nread);
+    if (rv == SSL_READ_EARLY_DATA_ERROR) {
+      auto err = SSL_get_error(tls.ssl, rv);
+      switch (err) {
+      case SSL_ERROR_WANT_READ:
+      case SSL_ERROR_WANT_WRITE: // TODO Probably not required.
+        return 0;
+      case SSL_ERROR_SSL:
+        if (LOG_ENABLED(INFO)) {
+          LOG(INFO) << "SSL_read: "
+                    << ERR_error_string(ERR_get_error(), nullptr);
+        }
+        return SHRPX_ERR_NETWORK;
+      default:
+        if (LOG_ENABLED(INFO)) {
+          LOG(INFO) << "SSL_read: SSL_get_error returned " << err;
+        }
+        return SHRPX_ERR_NETWORK;
+      }
+    }
+
+    if (LOG_ENABLED(INFO)) {
+      LOG(INFO) << "tls: read early data " << nread << " bytes";
+    }
+
+    if (rv == SSL_READ_EARLY_DATA_FINISH) {
+      if (LOG_ENABLED(INFO)) {
+        LOG(INFO) << "tls: read all early data";
+      }
+      tls.early_data_finish = true;
+      wlimit.startw();
+    }
+    return nread;
+  }
+#endif // OPENSSL_1_1_1_API
+
   // SSL_read requires the same arguments (buf pointer and its
   // length) on SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE.
   // rlimit_.avail() or rlimit_.avail() may return different length
